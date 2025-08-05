@@ -775,12 +775,28 @@ function initJson(file) {
   return new Promise((resolve, reject) => {
     fs.readFile(file, 'utf8', (error, data) => {
       if (error) {
-        resolve([]);
+        resolve({ latest_block: 0, events: [] });
       }
       try {
-        resolve(JSON.parse(data));
+        const parsed = JSON.parse(data);
+        
+        // Check if it's the old format (array) or new format (object with latest_block and events)
+        if (Array.isArray(parsed)) {
+          // Old format: convert to new format
+          const newFormat = {
+            latest_block: parsed.length > 0 ? parsed[parsed.length - 1].blockNumber : 0,
+            events: parsed
+          };
+          resolve(newFormat);
+        } else if (parsed && typeof parsed === 'object' && parsed.events && Array.isArray(parsed.events)) {
+          // New format: return as is
+          resolve(parsed);
+        } else {
+          // Invalid format: return empty new format
+          resolve({ latest_block: 0, events: [] });
+        }
       } catch (error) {
-        resolve([]);
+        resolve({ latest_block: 0, events: [] });
       }
     });
   });
@@ -791,11 +807,20 @@ function loadCachedEvents({ type, currency, amount }) {
     const module = require(`./cache/${netName.toLowerCase()}/${type}s_${currency}_${amount}.json`);
 
     if (module) {
-      const events = module;
-
-      return {
-        events,
-        lastBlock: events[events.length - 1].blockNumber
+      // Handle both old and new formats
+      if (Array.isArray(module)) {
+        // Old format
+        const events = module;
+        return {
+          events,
+          lastBlock: events.length > 0 ? events[events.length - 1].blockNumber : deployedBlockNumber
+        }
+      } else if (module.events && Array.isArray(module.events)) {
+        // New format
+        return {
+          events: module.events,
+          lastBlock: module.latest_block || (module.events.length > 0 ? module.events[module.events.length - 1].blockNumber : deployedBlockNumber)
+        }
       }
     }
   } catch (err) {
@@ -878,200 +903,44 @@ async function fetchEvents({ type, currency, amount }) {
           } else {
             mapWithdrawEvents();
           }
+          
+          return j; // Return the end block number
         }
 
-        async function updateCache() {
+        async function updateCache(endBlock) {
           try {
             const fileName = `./cache/${netName.toLowerCase()}/${type}s_${currency}_${amount}.json`;
-            const localEvents = await initJson(fileName);
-            const events = localEvents.concat(fetchedEvents);
-            await fs.writeFileSync(fileName, JSON.stringify(events, null, 2), 'utf8');
+            const cachedData = await initJson(fileName);
+            const allEvents = cachedData.events.concat(fetchedEvents);
+            
+            // Use the passed endBlock as the latest block
+            const newData = {
+              latest_block: endBlock,
+              events: allEvents
+            };
+            
+            await fs.writeFileSync(fileName, JSON.stringify(newData, null, 2), 'utf8');
           } catch (error) {
             throw new Error('Writing cache file failed:',error);
           }
         }
-        await fetchWeb3Events(i);
-        await updateCache();
+        const endBlock = await fetchWeb3Events(i);
+        await updateCache(endBlock);
       }
     } catch (error) {
       throw new Error("Error while updating cache");
       process.exit(1);
     }
   }
-
-  async function syncGraphEvents() {
-    let options = {};
-    if (torPort) {
-      options = { httpsAgent: new SocksProxyAgent('socks5h://127.0.0.1:' + torPort), headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0' } };
-    }
-
-    async function queryLatestTimestamp() {
-      try {
-        const variables = {
-          currency: currency.toString(),
-          amount: amount.toString()
-        }
-        if (type === "deposit") {
-          const query = {
-            query: `
-            query($currency: String, $amount: String){
-              deposits(first: 1, orderBy: timestamp, orderDirection: desc, where: {currency: $currency, amount: $amount}) {
-                timestamp
-              }
-            }
-            `,
-            variables
-          }
-          const querySubgraph = await axios.post(subgraph, query, options);
-          const queryResult = querySubgraph.data.data.deposits;
-          const result = queryResult[0].timestamp;
-          return Number(result);
-        } else {
-          const query = {
-            query: `
-            query($currency: String, $amount: String){
-              withdrawals(first: 1, orderBy: timestamp, orderDirection: desc, where: {currency: $currency, amount: $amount}) {
-                timestamp
-              }
-            }
-            `,
-            variables
-          }
-          const querySubgraph = await axios.post(subgraph, query, options);
-          const queryResult = querySubgraph.data.data.withdrawals;
-          const result = queryResult[0].timestamp;
-          return Number(result);
-        }
-      } catch (error) {
-        console.error("Failed to fetch latest event from thegraph");
-      }
-    }
-
-    async function queryFromGraph(timestamp) {
-      try {
-        const variables = {
-          currency: currency.toString(),
-          amount: amount.toString(),
-          timestamp: timestamp
-        }
-        if (type === "deposit") {
-          const query = {
-            query: `
-            query($currency: String, $amount: String, $timestamp: Int){
-              deposits(orderBy: timestamp, first: 1000, where: {currency: $currency, amount: $amount, timestamp_gt: $timestamp}) {
-                blockNumber
-                transactionHash
-                commitment
-                index
-                timestamp
-              }
-            }
-            `,
-            variables
-          }
-          const querySubgraph = await axios.post(subgraph, query, options);
-          const queryResult = querySubgraph.data.data.deposits;
-          const mapResult = queryResult.map(({ blockNumber, transactionHash, commitment, index, timestamp }) => {
-            return {
-              blockNumber: Number(blockNumber),
-              transactionHash,
-              commitment,
-              leafIndex: Number(index),
-              timestamp
-            }
-          });
-          return mapResult;
-        } else {
-          const query = {
-            query: `
-            query($currency: String, $amount: String, $timestamp: Int){
-              withdrawals(orderBy: timestamp, first: 1000, where: {currency: $currency, amount: $amount, timestamp_gt: $timestamp}) {
-                blockNumber
-                transactionHash
-                nullifier
-                to
-                fee
-              }
-            }
-            `,
-            variables
-          }
-          const querySubgraph = await axios.post(subgraph, query, options);
-          const queryResult = querySubgraph.data.data.withdrawals;
-          const mapResult = queryResult.map(({ blockNumber, transactionHash, nullifier, to, fee }) => {
-            return {
-              blockNumber: Number(blockNumber),
-              transactionHash,
-              nullifierHash: nullifier,
-              to,
-              fee
-            }
-          });
-          return mapResult;
-        }
-      } catch (error) {
-        console.error(error);
-      }
-    }
-
-    async function updateCache(fetchedEvents) {
-      try {
-        const fileName = `./cache/${netName.toLowerCase()}/${type}s_${currency}_${amount}.json`;
-        const localEvents = await initJson(fileName);
-        const events = localEvents.concat(fetchedEvents);
-        await fs.writeFileSync(fileName, JSON.stringify(events, null, 2), 'utf8');
-      } catch (error) {
-        throw new Error('Writing cache file failed:',error);
-      }
-    }
-
-    async function fetchGraphEvents() {
-      console.log("Querying latest events from TheGraph");
-      const latestTimestamp = await queryLatestTimestamp();
-      if (latestTimestamp) {
-        const getCachedBlock = await web3.eth.getBlock(startBlock);
-        const cachedTimestamp = getCachedBlock.timestamp;
-        for (let i = cachedTimestamp; i < latestTimestamp;) {
-          const result = await queryFromGraph(i);
-          if (Object.keys(result).length === 0) {
-            i = latestTimestamp;
-          } else {
-            if (type === "deposit") {
-              const resultBlock = result[result.length - 1].blockNumber;
-              const resultTimestamp = result[result.length - 1].timestamp;
-              await updateCache(result);
-              i = resultTimestamp;
-              console.log("Fetched", amount, currency.toUpperCase(), type, "events to block:", Number(resultBlock));
-            } else {
-              const resultBlock = result[result.length - 1].blockNumber;
-              const getResultBlock = await web3.eth.getBlock(resultBlock);
-              const resultTimestamp = getResultBlock.timestamp;
-              await updateCache(result);
-              i = resultTimestamp;
-              console.log("Fetched", amount, currency.toUpperCase(), type, "events to block:", Number(resultBlock));
-            }
-          }
-        }
-      } else {
-        console.log("Fallback to web3 events");
-        await syncEvents();
-      }
-    }
-    await fetchGraphEvents();
-  }
-  if (!privateRpc && !subgraph && !isTestRPC) {
-    await syncGraphEvents();
-  } else {
-    await syncEvents();
-  }
+  await syncEvents();
 
   async function loadUpdatedEvents() {
     const fileName = `./cache/${netName.toLowerCase()}/${type}s_${currency}_${amount}.json`;
-    const updatedEvents = await initJson(fileName);
-    const updatedBlock = updatedEvents[updatedEvents.length - 1].blockNumber;
+    const cachedData = await initJson(fileName);
+    const updatedBlock = cachedData.latest_block || (cachedData.events.length > 0 ? cachedData.events[cachedData.events.length - 1].blockNumber : 0);
     console.log("Cache updated for Tornado",type,amount,currency,"instance to block",updatedBlock,"successfully");
-    console.log(`Total ${type}s:`, updatedEvents.length);
-    return updatedEvents;
+    console.log(`Total ${type}s:`, cachedData.events.length);
+    return cachedData.events;
   }
   const events = await loadUpdatedEvents();
   return events;
